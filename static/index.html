@@ -126,7 +126,8 @@ function renderTable(cohorts) {
     }
     const retry = p && p.status === "failed"
       ? ' <button type="button" class="ghost" style="padding:4px 10px;font-size:12px" ' +
-        'onclick="retryCohort(\'' + c.cohort_id.replace(/'/g, "\\'") + '\')">立即重试</button>'
+        'onclick="retryCohort(\'' + c.cohort_id.replace(/'/g, "\\'") + '\', \'' +
+        String(p.revision).replace(/'/g, "\\'") + '\')">立即重试</button>'
       : "";
     const errDetail = p && p.last_error
       ? '<div class="err-detail">' + escapeHtml(p.last_error) + "</div>" : "";
@@ -150,12 +151,26 @@ function escapeHtml(s) {
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
 
-async function retryCohort(cohortId) {
+async function retryCohort(cohortId, revision) {
   const msg = document.getElementById("uploadMsg");
-  const resp = await fetch("/api/cohorts/" + encodeURIComponent(cohortId) + "/retry", {method: "POST"});
+  const body = revision === undefined ? {} : {revision: String(revision)};
+  const resp = await fetch("/api/cohorts/" + encodeURIComponent(cohortId) + "/retry", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body)
+  });
   const data = await resp.json().catch(() => ({}));
-  if (resp.ok) { showMsg(msg, "ok", "队列 " + cohortId + " 已重新排入待生成队列"); }
-  else { showMsg(msg, "err", "重试失败: " + (data.detail || resp.status)); }
+  if (resp.ok) {
+    if (data.status === "published") {
+      showMsg(msg, "ok", "队列 " + cohortId + " 当前包（rev" + data.revision + "）已发布，无需重试");
+    } else {
+      showMsg(msg, "ok", "队列 " + cohortId + " 的现行修订 rev" + data.revision +
+                        " 已重新排入待生成队列");
+    }
+  } else {
+    const current = data.current_revision ? "（现行修订 rev" + data.current_revision + "）" : "";
+    showMsg(msg, "err", "重试未生效" + current + "：" + (data.detail || resp.status));
+  }
   refresh();
 }
 window.retryCohort = retryCohort;

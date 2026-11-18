@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime, timezone
 
 from . import config
 
@@ -81,30 +82,56 @@ def init_db() -> None:
             conn.close()
 
 
-def reset_interrupted_packages() -> None:
+def reset_interrupted_packages() -> int:
     """Startup recovery rule.
 
-    A package left in ``generating`` means the process died mid-build: it must
-    be visible as to-be-generated again, retried immediately (backoff cleared),
-    and must never serve a half-written file. Failed packages keep their error
-    notes but are also retried without delay after a restart.
+    A package left in ``generating`` means the process died mid-build. Only
+    packages that still belong to their cohort's current revision may go back
+    to the queue: they are reset to ``pending``, retried immediately (backoff
+    cleared) and never served half-written. A ``failed`` package is treated the
+    same way, keeping its error note in the database.
+
+    Any non-terminal package whose revision is no longer current (it is
+    superseded, but a crash or an older build may have left it pending /
+    generating / failed) is withdrawn instead of being re-queued. This is what
+    guarantees an old package stays withdrawn across a restart.
     """
     with write_lock:
         conn = get_conn()
         try:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute(
+            stale = conn.execute(
+                """
+                UPDATE packages
+                   SET status = 'superseded',
+                       next_retry_at = NULL,
+                       updated_at = ?
+                 WHERE status IN ('pending', 'generating', 'failed')
+                   AND revision IS NOT (
+                       SELECT c.current_revision FROM cohorts c
+                        WHERE c.cohort_id = packages.cohort_id
+                   )
+                """,
+                (now,),
+            )
+            current = conn.execute(
                 """
                 UPDATE packages
                    SET status = 'pending',
                        next_retry_at = NULL,
                        attempts = 0,
-                       updated_at = CURRENT_TIMESTAMP
+                       updated_at = ?
                  WHERE status IN ('generating', 'failed')
-                """
+                   AND revision IS (
+                       SELECT c.current_revision FROM cohorts c
+                        WHERE c.cohort_id = packages.cohort_id
+                   )
+                """,
+                (now,),
             )
             conn.execute("COMMIT")
-            return cur.rowcount
+            return stale.rowcount + current.rowcount
         except Exception:
             conn.execute("ROLLBACK")
             raise

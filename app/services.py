@@ -13,6 +13,32 @@ class ConflictError(Exception):
     """The same revision number was already accepted with different content."""
 
 
+class CohortNotFoundError(Exception):
+    """The cohort does not exist."""
+
+
+class RetryRejectedError(Exception):
+    """A retry request cannot apply to the cohort's current package.
+
+    Carries the current revision (when known) so callers can tell the data
+    team which revision is actually in force instead of silently reviving an
+    older, already withdrawn package.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        current_revision: str | None = None,
+        package_status: str | None = None,
+        http_status: int = 409,
+    ) -> None:
+        super().__init__(message)
+        self.current_revision = current_revision
+        self.package_status = package_status
+        self.http_status = http_status
+
+
 class StaleRevisionError(Exception):
     """The package being finalised no longer belongs to the current revision."""
 
@@ -148,20 +174,157 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
             conn.close()
 
 
+def rearm_current_package(cohort_id: str, expected_revision: str | None = None) -> dict:
+    """Re-arm the current revision's package if — and only if — it truly failed.
+
+    The read of ``cohorts.current_revision`` and the state change happen inside
+    one ``BEGIN IMMEDIATE`` transaction guarded by the process write lock, so a
+    new revision accepted just before or just after this call cannot be
+    overtaken by a retry aimed at an older package:
+
+    * the UPDATE itself is conditional on the row still being the cohort's
+      current revision and still ``failed``;
+    * if the caller tells us which revision it saw (``expected_revision``), a
+      mismatch is rejected with the current revision in the message and
+      nothing is modified — a stale request never revives an old package and
+      never reports success;
+    * a current package that is not ``failed`` is reported as such, again
+      without touching it.
+    """
+    with write_lock:
+        conn = get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cohort = conn.execute(
+                "SELECT current_revision FROM cohorts WHERE cohort_id = ?",
+                (cohort_id,),
+            ).fetchone()
+            if cohort is None:
+                conn.execute("COMMIT")
+                raise CohortNotFoundError(cohort_id)
+
+            current = cohort["current_revision"]
+            current_label = None if current is None else str(current)
+            if current_label is None:
+                conn.execute("COMMIT")
+                raise RetryRejectedError(
+                    "队列尚未受理任何修订，没有可重试的包",
+                    http_status=409,
+                )
+
+            if expected_revision is not None and str(expected_revision) != current_label:
+                conn.execute("COMMIT")
+                raise RetryRejectedError(
+                    f"请求重试的修订 {expected_revision} 已不是现行修订，"
+                    f"现行修订为 {current_label}；旧包保持已撤下，未重新排队",
+                    current_revision=current_label,
+                    http_status=409,
+                )
+
+            pkg = conn.execute(
+                "SELECT status FROM packages WHERE cohort_id = ? AND revision = ?",
+                (cohort_id, current),
+            ).fetchone()
+            if pkg is None:
+                conn.execute("COMMIT")
+                raise RetryRejectedError(
+                    f"现行修订 {current_label} 没有待生成的包",
+                    current_revision=current_label,
+                    http_status=404,
+                )
+
+            status = pkg["status"]
+            if status == "published":
+                conn.execute("COMMIT")
+                return {"status": "published", "revision": current_label}
+            if status != "failed":
+                conn.execute("COMMIT")
+                raise RetryRejectedError(
+                    f"现行修订 {current_label} 的包状态为 {status}，无需重试",
+                    current_revision=current_label,
+                    package_status=status,
+                    http_status=409,
+                )
+
+            cur = conn.execute(
+                """
+                UPDATE packages
+                   SET status = 'pending', next_retry_at = NULL, updated_at = ?
+                 WHERE cohort_id = ? AND revision = ? AND status = 'failed'
+                   AND revision = (
+                       SELECT current_revision FROM cohorts WHERE cohort_id = ?
+                   )
+                """,
+                (_utcnow(), cohort_id, current, cohort_id),
+            )
+            if cur.rowcount != 1:
+                # Defensive: the guarded UPDATE means a revision accepted
+                # concurrently wins; report the state instead of reviving.
+                latest = conn.execute(
+                    "SELECT current_revision FROM cohorts WHERE cohort_id = ?",
+                    (cohort_id,),
+                ).fetchone()
+                conn.execute("COMMIT")
+                raise RetryRejectedError(
+                    "重试请求已过期：现行修订在受理过程中发生变化，旧包未重新排队",
+                    current_revision=str(latest["current_revision"])
+                    if latest and latest["current_revision"] is not None
+                    else current_label,
+                    http_status=409,
+                )
+            conn.execute("COMMIT")
+            return {"status": "pending", "revision": current_label}
+        except (CohortNotFoundError, RetryRejectedError):
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+
 def claim_pending_package() -> tuple[str, str] | None:
     """Atomically claim one due package for building (``pending`` or a
-    ``failed`` package whose backoff has elapsed)."""
+    ``failed`` package whose backoff has elapsed).
+
+    Only a package that is still its cohort's *current* revision can be
+    claimed. A non-terminal row left behind for an older revision (for example
+    by a crash between the supersede commit and the worker's next tick) is
+    withdrawn to ``superseded`` in the same transaction and never built.
+    """
     now = _utcnow()
     with write_lock:
         conn = get_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # Withdraw any non-terminal package whose revision is no longer
+            # current before looking for work. This also covers rows that were
+            # ``failed`` and whose retry time had elapsed.
+            conn.execute(
+                """
+                UPDATE packages
+                   SET status = 'superseded', next_retry_at = NULL, updated_at = ?
+                 WHERE status IN ('pending', 'generating', 'failed')
+                   AND revision IS NOT (
+                       SELECT c.current_revision FROM cohorts c
+                        WHERE c.cohort_id = packages.cohort_id
+                   )
+                """,
+                (now,),
+            )
             row = conn.execute(
                 """
-                SELECT cohort_id, revision FROM packages
-                 WHERE status = 'pending'
-                    OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= ?))
-                 ORDER BY updated_at
+                SELECT p.cohort_id, p.revision FROM packages p
+                 WHERE (p.status = 'pending'
+                    OR (p.status = 'failed' AND (p.next_retry_at IS NULL OR p.next_retry_at <= ?)))
+                   AND p.revision IS (
+                       SELECT c.current_revision FROM cohorts c
+                        WHERE c.cohort_id = p.cohort_id
+                   )
+                 ORDER BY p.updated_at
                  LIMIT 1
                 """,
                 (now,),
@@ -169,11 +332,21 @@ def claim_pending_package() -> tuple[str, str] | None:
             if row is None:
                 conn.execute("COMMIT")
                 return None
-            conn.execute(
-                "UPDATE packages SET status = 'generating', attempts = attempts + 1, "
-                "updated_at = ? WHERE cohort_id = ? AND revision = ?",
-                (now, row["cohort_id"], row["revision"]),
+            cur = conn.execute(
+                """
+                UPDATE packages
+                   SET status = 'generating', attempts = attempts + 1, updated_at = ?
+                 WHERE cohort_id = ? AND revision = ?
+                   AND status IN ('pending', 'failed')
+                   AND revision = (
+                       SELECT current_revision FROM cohorts WHERE cohort_id = ?
+                   )
+                """,
+                (now, row["cohort_id"], row["revision"], row["cohort_id"]),
             )
+            if cur.rowcount != 1:
+                conn.execute("COMMIT")
+                return None
             conn.execute("COMMIT")
             return row["cohort_id"], row["revision"]
         except Exception:
@@ -186,13 +359,38 @@ def claim_pending_package() -> tuple[str, str] | None:
 def finalize_package(cohort_id: str, revision_label: str) -> None:
     """Build the de-identified package and publish it.
 
-    The final UPDATE is conditional on the package still being ``generating``
-    and the revision still being current for the cohort. A late build for a
-    revision that was superseded while the worker was busy is discarded
-    instead of overwriting the newer revision's state.
+    The build runs outside any database transaction; the state is checked
+    twice:
+
+    1. before doing any work, the claimed revision must still be the cohort's
+       current revision, otherwise nothing is built;
+    2. the final UPDATE is conditional on the package still being
+       ``generating`` and the revision still being current for the cohort.
+
+    A late build for a revision that was superseded while the worker was busy
+    is discarded instead of overwriting the newer revision's state, and any
+    file it might have written is removed so it can never be downloaded.
     """
     conn = get_conn()
     try:
+        current = conn.execute(
+            "SELECT current_revision FROM cohorts WHERE cohort_id = ?",
+            (cohort_id,),
+        ).fetchone()
+        if current is None or str(current["current_revision"]) != str(revision_label):
+            raise StaleRevisionError(
+                f"修订 {revision_label} 已不是队列当前修订，跳过生成"
+            )
+        claimed = conn.execute(
+            "SELECT status FROM packages WHERE cohort_id = ? AND revision = ?",
+            (cohort_id, revision_label),
+        ).fetchone()
+        if claimed is None or claimed["status"] != "generating":
+            raise StaleRevisionError(
+                f"修订 {revision_label} 的包未被领取（状态: "
+                f"{claimed['status'] if claimed else 'missing'}），跳过生成"
+            )
+
         revision = conn.execute(
             "SELECT * FROM revisions WHERE cohort_id = ? AND revision = ?",
             (cohort_id, revision_label),
@@ -219,6 +417,7 @@ def finalize_package(cohort_id: str, revision_label: str) -> None:
 
         now = _utcnow()
         with write_lock:
+            conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 """
                 UPDATE packages
@@ -234,6 +433,7 @@ def finalize_package(cohort_id: str, revision_label: str) -> None:
                 (str(package_path), now, cohort_id, revision_label, cohort_id),
             )
             if cur.rowcount == 0:
+                conn.execute("COMMIT")
                 # Late build: a newer revision superseded this one. Discard the
                 # artifact so it can never be mistaken for the current package.
                 package_path.unlink(missing_ok=True)
@@ -245,6 +445,7 @@ def finalize_package(cohort_id: str, revision_label: str) -> None:
                     f"修订 {revision_label} 的迟到生成结果已丢弃 (当前状态: "
                     f"{state['status'] if state else 'missing'})"
                 )
+            conn.execute("COMMIT")
     finally:
         conn.close()
 
@@ -253,7 +454,10 @@ def mark_failed(cohort_id: str, revision_label: str, error: str) -> None:
     """Record a build failure with capped exponential backoff.
 
     A failure stays visible as to-be-generated: the worker retries it, a
-    restart retries it immediately, and it can never be downloaded.
+    restart retries it immediately, and it can never be downloaded. The UPDATE
+    only touches a package that is still ``generating`` *and* still belongs to
+    the cohort's current revision, so a failure reported late for an already
+    superseded revision cannot revive the withdrawn package.
     """
     delay = min(60, 2 ** min(_attempts(cohort_id, revision_label), 6))
     next_retry = datetime.now(timezone.utc).timestamp() + delay
@@ -271,8 +475,11 @@ def mark_failed(cohort_id: str, revision_label: str, error: str) -> None:
                        next_retry_at = ?,
                        updated_at = ?
                  WHERE cohort_id = ? AND revision = ? AND status = 'generating'
+                   AND revision = (
+                       SELECT current_revision FROM cohorts WHERE cohort_id = ?
+                   )
                 """,
-                (error[:1000], next_retry_text, _utcnow(), cohort_id, revision_label),
+                (error[:1000], next_retry_text, _utcnow(), cohort_id, revision_label, cohort_id),
             )
         finally:
             conn.close()

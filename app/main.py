@@ -5,14 +5,20 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config
 from .csvutil import CSVValidationError, parse_csv
 from .database import get_conn, init_db, reset_interrupted_packages
-from .services import ConflictError, accept_revision
+from .services import (
+    CohortNotFoundError,
+    ConflictError,
+    RetryRejectedError,
+    accept_revision,
+    rearm_current_package,
+)
 from .worker import PackageWorker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -28,7 +34,7 @@ async def lifespan(_app: FastAPI):
     init_db()
     recovered = reset_interrupted_packages()
     if recovered:
-        log.info("startup recovery: %d interrupted package(s) back to pending", recovered)
+        log.info("startup recovery: %d package(s) re-queued or withdrawn", recovered)
     worker.start()
     try:
         yield
@@ -152,38 +158,40 @@ def cohort_status(cohort_id: str) -> dict:
 
 
 @app.post("/api/cohorts/{cohort_id}/retry")
-def retry_current(cohort_id: str) -> dict:
-    """Re-arm the current package for an immediate attempt (failure recovery)."""
-    conn = get_conn()
+def retry_current(
+    cohort_id: str,
+    body: dict | None = Body(default=None, description='可选 {"revision": "<看到的修订号>"}'),
+) -> JSONResponse:
+    """Re-arm the current package for an immediate attempt (failure recovery).
+
+    The optional ``revision`` field is the revision the caller believes is
+    current (the UI sends the one it rendered). If a newer revision has been
+    accepted meanwhile, the request is rejected with the current revision and
+    the withdrawn old package is never re-queued or reported as successful.
+    Even without that hint, the re-arm only applies to a package that is still
+    current and still ``failed`` at the moment of the guarded UPDATE.
+    """
+    expected = None
+    if isinstance(body, dict) and body.get("revision") is not None:
+        expected = str(body["revision"])
+        if not config.is_valid_identifier(expected):
+            raise HTTPException(status_code=400, detail="修订号只能包含字母、数字、_ - . 且长度 ≤128")
+
     try:
-        cohort = conn.execute(
-            "SELECT current_revision FROM cohorts WHERE cohort_id = ?", (cohort_id,)
-        ).fetchone()
-        if cohort is None:
-            raise HTTPException(status_code=404, detail="队列不存在")
-        revision_label = cohort["current_revision"]
-        pkg = conn.execute(
-            "SELECT status FROM packages WHERE cohort_id = ? AND revision = ?",
-            (cohort_id, revision_label),
-        ).fetchone()
-        if pkg is None:
-            raise HTTPException(status_code=404, detail="当前修订没有待生成的包")
-        if pkg["status"] == "published":
-            return {"status": "published", "revision": str(revision_label)}
-        if pkg["status"] != "failed":
-            raise HTTPException(
-                status_code=409,
-                detail=f"当前包状态为 {pkg['status']}，无需重试",
-            )
-        conn.execute(
-            "UPDATE packages SET status = 'pending', next_retry_at = NULL, "
-            "updated_at = CURRENT_TIMESTAMP "
-            "WHERE cohort_id = ? AND revision = ?",
-            (cohort_id, revision_label),
-        )
-        return {"status": "pending", "revision": str(revision_label)}
-    finally:
-        conn.close()
+        result = rearm_current_package(cohort_id, expected_revision=expected)
+    except CohortNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="队列不存在") from exc
+    except RetryRejectedError as exc:
+        payload = {"detail": str(exc)}
+        if exc.current_revision is not None:
+            payload["current_revision"] = exc.current_revision
+        if exc.package_status is not None:
+            payload["package_status"] = exc.package_status
+        return JSONResponse(status_code=exc.http_status, content=payload)
+
+    payload = {"status": result["status"], "revision": result["revision"]}
+    payload["current_revision"] = result["revision"]
+    return JSONResponse(status_code=200, content=payload)
 
 
 @app.get("/api/cohorts/{cohort_id}/package")
@@ -224,12 +232,14 @@ def download_current_package(cohort_id: str):
         path = Path(pkg["package_path"])
         if not path.is_file():
             # File vanished underneath us: surface as to-be-generated, never
-            # as a partial download, and re-arm generation immediately.
+            # as a partial download, and re-arm generation immediately. The
+            # guard keeps this from touching a revision superseded meanwhile.
             conn.execute(
                 "UPDATE packages SET status = 'pending', next_retry_at = NULL, "
                 "updated_at = CURRENT_TIMESTAMP "
-                "WHERE cohort_id = ? AND revision = ?",
-                (cohort_id, revision_label),
+                "WHERE cohort_id = ? AND revision = ? AND status = 'published' "
+                "AND revision = (SELECT current_revision FROM cohorts WHERE cohort_id = ?)",
+                (cohort_id, revision_label, cohort_id),
             )
             raise HTTPException(status_code=409, detail="包文件缺失，已重新排队生成")
         return FileResponse(
